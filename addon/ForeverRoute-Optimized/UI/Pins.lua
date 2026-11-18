@@ -287,14 +287,25 @@ function Pins.Near(m, x, y, yd)
   yd = yd or NEAR_YD
   return (px - wx) ^ 2 + (py - wy) ^ 2 <= yd * yd
 end
-local lastPathKey
+local lastPathKey, pinSteps
 function Pins.Update(force)
+  ns.Engine.ReadPass(function() Pins.UpdateInner(force) end)
+end
+function Pins.UpdateInner(force)
   local list, spots = {}, {}
   local cur = ns.Engine.Shown()
   -- (none inside a dungeon: there is no position in there to place them by, and the card is about the dungeon)
   if ns.db.pins and ForeverRouteData and cur and not (ns.Dungeon and ns.Dungeon.Inside()) then
-    list[1] = cur
-    for _, i in ipairs(ns.Engine.Upcoming(cur, (ns.db.pinCount or 4) - 1)) do list[#list + 1] = i end
+    local steps, count = ForeverRouteData.steps, ns.db.pinCount or 4
+    local rev, taken = ns.Engine.progressRevision, ns.Next and ns.Next.taken
+    if not force and pinSteps and pinSteps.steps == steps and pinSteps.n == #steps and pinSteps.cur == cur
+      and pinSteps.count == count and pinSteps.rev == rev and pinSteps.taken == taken then
+      list = pinSteps.list
+    else
+      list[1] = cur
+      for _, i in ipairs(ns.Engine.Upcoming(cur, count - 1)) do list[#list + 1] = i end
+      pinSteps = { steps = steps, n = #steps, cur = cur, count = count, rev = rev, taken = taken, list = list }
+    end
   end
   -- where each pin goes, and whether the card's step is near enough for the minimap. Nearness is part of the key:
   -- walking up to a step changes neither the steps nor the zone, but its minimap pin has to appear (and go once you

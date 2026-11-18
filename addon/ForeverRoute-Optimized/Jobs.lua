@@ -22,6 +22,18 @@ Jobs._driver = driver -- (the perf battery ticks it)
 Jobs.current = nil -- the job being resumed
 Jobs._queue = queue -- (tests)
 
+function Jobs.Mark(phase)
+  local job = Jobs.current
+  if not (job and job.kind == "solve" and coroutine.running() == job.co) then return nil end
+  local previous = job.phase
+  if previous ~= phase then
+    local now = debugprofilestop()
+    if previous and ns.Time then ns.Time("solve phase " .. previous, now - job.phaseAt) end
+    job.phase, job.phaseAt = phase, now
+  end
+  return previous
+end
+
 local function sortQueue()
   table.sort(queue, function(a, b) if a.pri ~= b.pri then return a.pri < b.pri end return a.seq < b.seq end)
 end
@@ -48,8 +60,10 @@ local function resume(job, budget)
   local t0 = debugprofilestop()
   ns.sliceCo, ns.sliceT0, ns.sliceBudget = job.co, t0, budget or job.budget
   Jobs.current = job
+  if job.kind == "solve" then job.phaseAt = t0 end
   job.slices = (job.slices or 0) + 1
   local ok, r = coroutine.resume(job.co, job.arg)
+  if job.kind == "solve" and job.phase and ns.Time then ns.Time("solve phase " .. job.phase, debugprofilestop() - job.phaseAt) end
   Jobs.current = cur0
   ns.sliceCo, ns.sliceT0, ns.sliceBudget = co0, t00, b0
   if job.timeAs and ns.Time then ns.Time(job.timeAs, debugprofilestop() - t0) end

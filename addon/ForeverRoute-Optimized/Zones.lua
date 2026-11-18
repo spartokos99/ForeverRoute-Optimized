@@ -130,7 +130,7 @@ end
 -- paying at the level you'd be by then - until nothing more there is yours to take: the wall that sends you elsewhere.
 -- Quests that open up as you level in the zone count; ones you would outlevel before you get to them don't.
 local wallCache = {}
-for _, e in ipairs({ "FR_STATE", "QUEST_ACCEPTED", "QUEST_TURNED_IN", "QUEST_REMOVED", "QUEST_LOG_UPDATE", "PLAYER_LEVEL_UP", "FR_ROUTE_CHANGED", "FR_NOPE" }) do
+for _, e in ipairs({ "FR_STATE", "PLAYER_XP_UPDATE", "FR_ROUTE_CHANGED", "FR_NOPE" }) do
   ns.On(e, function() wallCache = {} end)
 end
 -- assume: { [quest] = true } handed in before you start (what a zone would hold once you did the chain start it needs)
@@ -194,7 +194,7 @@ local leftCache = {}
 -- (cleared on every quest or level change: kept by time, a count outlived a quest's hand-in and sent the zone-hopper to
 -- Redridge for quests it had already done)
 -- (and on "not doing": a quest you refused, and what its chain leads to, is no longer counted)
-for _, e in ipairs({ "FR_STATE", "QUEST_ACCEPTED", "QUEST_TURNED_IN", "QUEST_REMOVED", "QUEST_LOG_UPDATE", "PLAYER_LEVEL_UP", "FR_ROUTE_CHANGED", "FR_NOPE" }) do
+for _, e in ipairs({ "FR_STATE", "FR_ROUTE_CHANGED", "FR_NOPE" }) do
   ns.On(e, function() leftCache = {} end)
 end
 -- (the simulated world changes quests without the game's events: its player clears the counts before it looks; Skip

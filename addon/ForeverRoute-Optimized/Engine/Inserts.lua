@@ -216,20 +216,21 @@ ns.On("FR_LOADED", function() C_Timer.After(3.5, function() if Engine.MergeSideT
 
 -- the hand-in spots (ForeverRouteEnders) of the quests in your log: the list covers every quest you could take
 -- (~1000), so walk your log (at most 40) and look each one up instead of asking the game about all of them
+local logEnders, logEndersFor, logEndersRevision
 function Engine.LogEnders()
   local enders = ForeverRouteEnders
   if not enders then return {} end
+  if logEndersFor == enders and logEndersRevision == State.logRevision then return logEnders end
   local inLog = {}
-  Engine.logLevels = {} -- quest level by id, for the gray check below
-  local n = C_QuestLog and C_QuestLog.GetNumQuestLogEntries and select(2, pcall(C_QuestLog.GetNumQuestLogEntries))
-  if type(n) == "number" and n > 0 and C_QuestLog.GetInfo then
-    for i = 1, n do
-      local ok, info = pcall(C_QuestLog.GetInfo, i)
-      if ok and info and not info.isHeader and info.questID and enders[info.questID] then inLog[info.questID] = enders[info.questID]; Engine.logLevels[info.questID] = info.level end
-    end
-    return inLog
+  local ids, complete = State.LogIDs()
+  for id in pairs(ids) do if enders[id] then inLog[id] = enders[id] end end
+  -- Collapsed headers can hide off-route quests present at login, before any acceptance event.
+  if complete == false then
+    for id, e in pairs(enders) do if not inLog[id] and State.InLog(id) then inLog[id] = e end end
   end
-  return enders -- no quest log to read (tests): every spot, each checked with QuestReady
+  Engine.logLevels = State.logLevels
+  logEnders, logEndersFor, logEndersRevision = inLog, enders, State.logRevision
+  return inLog
 end
 -- finished quests in your log with no hand-in on the route: add one where it costs least
 -- Where it costs least by the walk can be where the plan next passes the hand-in, levels later: the quest is gray by
@@ -260,20 +261,26 @@ local function applyInserts()
   if not (ForeverRouteEnders and ForeverRouteData and #list > 0) then return false end
   -- side trips (special rewards, dungeon routes) are their own short list: your leveling path handles the extras
   if ForeverRouteData.dungeon or ForeverRouteData.special then return false end
+  local candidates = {}
+  for q, e in pairs(Engine.LogEnders()) do
+    -- A yielding route job must also retain quests that may become ready between slices.
+    if ns.sliceCo or (not ns.Nope(q) and ns.State.QuestReady(q) and not ns.State.IsCompleted(q)) then candidates[q] = e end
+  end
+  if not next(candidates) then return false end
   local have = {}
   -- (a hand-in behind you in the built-in plan is not on the route: Engine.BehindYou)
   local behind = {}
-  for _, s in ipairs(list) do if s.k == "turnin" and s.q then if Engine.BehindYou(s) then behind[s.q] = true else have[s.q] = true end end end
+  for _, s in ipairs(list) do if s.k == "turnin" and candidates[s.q] then if Engine.BehindYou(s) then behind[s.q] = true else have[s.q] = true end end end
   local px, py, pinst = HBD:GetPlayerWorldPosition()
   local added = false
   -- (on a zone you picked: only the hand-ins in that zone - the rest wait for your way back to the plan, as a side quest's
   -- stops do (Side.lua). A short zone route's end was the cheapest spot for every finished quest in the log, and the card
   -- sent a level 52 to Felwood, Winterspring and Un'Goro one after another - mutate --play)
   local zoneMaps; if not ForeverRouteData.zoneRoute then zoneMaps = false end
-  for q, e in pairs(Engine.LogEnders()) do
+  for q, e in pairs(candidates) do
     ns.MaybeYield() -- (a route job: a quest a pause)
     if zoneMaps == nil and not have[q] and ns.State.QuestReady(q) then zoneMaps = (ns.Stitch and ns.Stitch.ZoneMaps and ns.Stitch.ZoneMaps(ForeverRouteData)) or false end
-    if not have[q] and not (ns.Nope(q)) and ns.State.QuestReady(q) and not ns.State.IsCompleted(q) and not (zoneMaps and not zoneMaps[e.m]) then
+    if not have[q] and not ns.Nope(q) and ns.State.QuestReady(q) and not ns.State.IsCompleted(q) and not (zoneMaps and not zoneMaps[e.m]) then
       local step = { k = "turnin", q = q, name = e.name, npc = e.npc, m = e.m, x = e.x, y = e.y, r = 6, inserted = true,
         note = "Added: you finished this one on the way." }   -- its sec comes from where InsertStop puts it
       local ql, me = Engine.logLevels and Engine.logLevels[q], UnitLevel and UnitLevel("player")

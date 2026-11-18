@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.8-opt.1 - optimized fork
+- Keep live quest entries across log updates. Coalesce event bursts, update objectives in place, and avoid route refreshes for unchanged or empty logs. Support collapsed headers and the legacy quest-title API.
+- Cache route and leg progress, updating affected quests, their follow-ups and non-quest steps instead of repeatedly evaluating the whole plan. Full invalidation remains for structural changes, manual actions and route switches.
+- Partial objective count changes update progress without invalidating every step's status or relaunching the route solver; actual objective text and completion changes still invalidate as needed.
+- Build the adaptive solver's route indexes cooperatively across frames, including after a cancelled solve, rather than blocking a frame for the whole index.
+- Record solver phase and quest-state listener timings in the existing local performance log to help identify remaining frame spikes.
+- Skip unnecessary route-status reads while checking later visits, and inspect only ready quest hand-ins when finding inserted stops.
+- Remove the five-second stationary re-solve and list rebuild. Changes to movement, quest state, bags, travel inputs and hold/dismissal expiry still wake the solver.
+- Share status reads within card/map updates, reuse upcoming pin indices and log hand-in lookups, and notify only the card when nearby-extra text changes.
+- `/fr perf` reports observed average/maximum work instead of executing ten refreshes. Event and timer timings remain available in reports; quest API and nearby-ready timer failures are logged.
+- Add headless regression/performance checks using the shipped paladin and warrior plans. No visual redesign, route-data changes or saved-setting migration. In-game performance still needs verification on the Forever client.
+
 ## 1.6.8 - 2026-11-17
 - A home base you picked keeps the quests you carry for it after a /reload or login. They used to drop off the route, so green quests in your log for that zone got no stops (Stranglethorn: The Second Rebellion, Some Assembly Required).
 - Logging in or reloading while on a flight, the card works out your step before it holds it for the flight. It used to grab the plan's next step and keep it the whole way (a trip to the Badlands on a Stranglethorn home base).

@@ -29,6 +29,7 @@ Next.BEHIND_WORK = 150  -- seconds: an objective's work and the way to it, for a
 Next.DISMISS_SECS = 900 -- "not now" on a while-you're-here stop: it stays off for this long...
 Next.DISMISS_YD = 500    -- ...or until you are this far from where you said it
 Next.dismissed = {}      -- step (the table: an inserted stop moves the numbers on) -> { t, x, y, inst }: where and when
+Next.revision = 0
 Next.RESOLVE = 2        -- seconds: re-solve at least this often while things change
 Next.SERVICE = { accept = 8, turnin = 10, obj = 90, fp = 15, train = 40, bind = 15, ["goto"] = 5 }
 -- (a "go to" step - a dungeon run, a place to be - is a commitment, not a stop to fit in: it stays where the plan has it)
@@ -57,6 +58,20 @@ local function knownTaxiCount() return ns.State.KnownTaxiCount() end
 local sigNow
 local function priceSig()
   return sigNow or (knownTaxiCount() .. ":" .. speedNow() .. ":" .. ((UnitLevel and UnitLevel("player")) or 1))
+end
+-- Changes with actual solver inputs, not with elapsed wall-clock time.
+function Next.InputSignature()
+  local now = GetTime()
+  for step, d in pairs(Next.dismissed) do
+    if now - d.t >= Next.DISMISS_SECS then Next.dismissed[step] = nil; Next.revision = Next.revision + 1 end
+  end
+  local cd = ns.HearthCooldown and ns.HearthCooldown()
+  return table.concat({ Next.revision, priceSig(), tostring(GetBindLocation and GetBindLocation()),
+    cd and cd > 0 and "cooldown" or "ready" }, ":")
+end
+for _, event in ipairs({ "FR_STATE", "FR_ROUTE_CHANGED", "FR_NOPE", "FR_SETTINGS",
+  "BAG_UPDATE_DELAYED", "PLAYER_LEVEL_UP", "PLAYER_CONTROL_GAINED", "PLAYER_ALIVE", "PLAYER_UNGHOST" }) do
+  ns.On(event, function() Next.revision = Next.revision + 1 end)
 end
 local zoneMemo, zoneTaxi, startKeys = setmetatable({}, { __mode = "k" }), nil, 0
 local function travelSecs(a, b)
@@ -216,9 +231,11 @@ local function walkable(a, b) return a.w[3] == b.w[3] and (a.st.m == b.st.m or y
 local function way(list)
   local W = wayMemo[list]
   if W and W.n == #list then return W end
+  local phase = ns.Jobs.Mark("route index")
   W = { n = #list, stops = {}, at = {}, gaps = {}, grid = {}, ver = 0 }
   local trips, bind = {}, nil
   for j, s in ipairs(list) do
+    if j % 8 == 0 then ns.MaybeYield() end
     if Next.TRIP[s.k] then trips[#trips + 1] = s
     else
       local w = wpos(s)
@@ -240,6 +257,7 @@ local function way(list)
     end
   end
   local C = Next.DEFER_CELL
+  local building = true
   local function put(w, k)
     local key = math.floor(w[1] / C) .. ":" .. math.floor(w[2] / C) .. ":" .. tostring(w[3])
     local c = W.grid[key]
@@ -251,7 +269,10 @@ local function way(list)
     put(x, k); put(y, k)
     if x[3] ~= y[3] then return end
     local n = math.floor(yd(x, y) / (C / 2))
-    for t = 1, n do put({ x[1] + (y[1] - x[1]) * t / (n + 1), x[2] + (y[2] - x[2]) * t / (n + 1), x[3] }, k) end
+    for t = 1, n do
+      if building and t % 32 == 0 then ns.MaybeYield() end
+      put({ x[1] + (y[1] - x[1]) * t / (n + 1), x[2] + (y[2] - x[2]) * t / (n + 1), x[3] }, k)
+    end
   end
   W.line = line
   local ports = (ns.Travel and ns.Travel.Ports) or function() return {} end
@@ -262,10 +283,13 @@ local function way(list)
     for _, p in ipairs(ports(y.st.m)) do if p[3] == y.w[3] then line(p, y.w, k) end end
   end
   for k, g in ipairs(W.gaps) do
+    ns.MaybeYield()
     if g.hearth then put(g.a.w, k); leg(g.hearth, g.b, k)
     else leg(g.a, g.b, k, g.pier) end
   end
+  building = false
   wayMemo[list] = W
+  if phase then ns.Jobs.Mark(phase) end
   return W
 end
 
@@ -398,7 +422,8 @@ local function workOf(list, q, except)
   local c = objWork[list]
   if not c or c.n ~= #list then
     c = { n = #list, by = {}, back = {} }
-    for _, t in ipairs(list) do
+    for i, t in ipairs(list) do
+      if i % 8 == 0 then ns.MaybeYield() end
       if t.k == "obj" and t.q then
         local e = c.by[t.q]; if not e then e = {}; c.by[t.q] = e end
         local known = tonumber(t.work) ~= nil
@@ -440,6 +465,20 @@ function Next.VisitHere(list, planned, from, pm, px, py, pinst)
   local TRIP = Next.TRIP
   local Lv = (UnitLevel and UnitLevel("player")) or 1
   local pre = ns.QUEST_PRE or {}
+  local function visitStatus(i)
+    local job = ns.Jobs.current
+    if not (job and job.kind == "solve" and ns.sliceCo == job.co) then return E.Status(i) end
+    local started = debugprofilestop()
+    local status = E.Status(i)
+    ns.Time("solve visit status " .. tostring(list[i].k), debugprofilestop() - started)
+    return status
+  end
+  local function visitPlan(a, b)
+    local phase = ns.Jobs.Mark("visit travel")
+    local result = planSecs(a, b)
+    ns.Jobs.Mark(phase)
+    return result
+  end
   local function preMet(q, handed)
     local p = pre[q]
     if p then
@@ -455,15 +494,15 @@ function Next.VisitHere(list, planned, from, pm, px, py, pinst)
   -- the visits: runs of steps between trips (or map changes); the first one on your map, past the window
   -- (only once the plan has left here - a trip, or steps somewhere else: until then it is still this visit)
   local left = false
-  for x = planned, from - 1 do local t = list[x]; if E.Status(x) ~= "done" and (TRIP[t.k] or (t.m and t.m ~= pm)) then left = true; break end end
+  for x = planned, from - 1 do local t = list[x]; if (TRIP[t.k] or (t.m and t.m ~= pm)) and visitStatus(x) ~= "done" then left = true; break end end
   local j, last = from, math.min(#list, from + Next.VISIT_SCAN)
   local prevPos -- the last place the plan is at before the visit (for the trip's length)
   while j <= last do
     ns.MaybeYield() -- (in the background solve: a slice a frame)
     local s = list[j]
     if TRIP[s.k] or not s.m or s.m ~= pm or not left then
-      if E.Status(j) ~= "done" and (TRIP[s.k] or (s.m and s.m ~= pm)) then left = true end
-      if s.m and not TRIP[s.k] and E.Status(j) ~= "done" then prevPos = s end
+      if (TRIP[s.k] or (s.m and s.m ~= pm)) and visitStatus(j) ~= "done" then left = true end
+      if s.m and not TRIP[s.k] and visitStatus(j) ~= "done" then prevPos = s end
       j = j + 1
     else
       -- a run on your map: j .. k
@@ -475,7 +514,7 @@ function Next.VisitHere(list, planned, from, pm, px, py, pinst)
       for x = j, k do
         if x % 8 == 0 then ns.MaybeYield() end
         local t = list[x]
-        local stx = E.Status(x)
+        local stx = visitStatus(x)
         if stx ~= "done" then
           any = true
           local can = true
@@ -504,12 +543,12 @@ function Next.VisitHere(list, planned, from, pm, px, py, pinst)
         -- the plan was before it to where it goes after, by the plan's real trips (flights, boats: planSecs). It was a
         -- straight line from the stop before plus a minute, whatever the plan flew, and nothing for the way out.
         local first, lastIn, after
-        for x = j, k do local t = list[x]; if wpos(t) and E.Status(x) ~= "done" then first = first or t; lastIn = t end end
-        for x = k + 1, math.min(#list, k + Next.VISIT_SCAN) do local t = list[x]; if not TRIP[t.k] and wpos(t) and E.Status(x) ~= "done" then after = t; break end end
-        local tin = prevPos and first and planSecs(prevPos, first)
+        for x = j, k do local t = list[x]; if wpos(t) and visitStatus(x) ~= "done" then first = first or t; lastIn = t end end
+        for x = k + 1, math.min(#list, k + Next.VISIT_SCAN) do local t = list[x]; if not TRIP[t.k] and wpos(t) and visitStatus(x) ~= "done" then after = t; break end end
+        local tin = prevPos and first and visitPlan(prevPos, first)
         local saves = tin
         if tin and after and lastIn then
-          local tout, past = planSecs(lastIn, after), planSecs(prevPos, after)
+          local tout, past = visitPlan(lastIn, after), visitPlan(prevPos, after)
           if tout and past then saves = tin + tout - past end
         end
         saves = math.max(Next.TRIP_MIN, saves or Next.TRIP_MIN)
@@ -527,7 +566,8 @@ function isHub(list, s) -- (declared above: passReach)
   if m ~= nil and m.list == list then return m.hub end
   local w, n = wpos(s), 0
   if w then
-    for _, t in ipairs(list) do
+    for i, t in ipairs(list) do
+      if i % 8 == 0 then ns.MaybeYield() end
       local tw = wpos(t)
       if tw and tw[3] == w[3] and (tw[1] - w[1]) ^ 2 + (tw[2] - w[2]) ^ 2 <= Next.HUB_YD ^ 2 then n = n + 1; if n >= Next.HUB_STEPS then break end end
     end
@@ -543,7 +583,14 @@ function chainsOnHere(list, s) -- (declared above: passReach)
   local w = wpos(s)
   if not (deps and w) then return false end
   local idx = acceptIdx[list]
-  if not idx then idx = {}; for _, t in ipairs(list) do if t.k == "accept" and t.q and not idx[t.q] then idx[t.q] = t end end; acceptIdx[list] = idx end
+  if not idx then
+    idx = {}
+    for i, t in ipairs(list) do
+      if i % 8 == 0 then ns.MaybeYield() end
+      if t.k == "accept" and t.q and not idx[t.q] then idx[t.q] = t end
+    end
+    acceptIdx[list] = idx
+  end
   for _, d in ipairs(deps) do
     local a = idx[d]
     local aw = a and wpos(a)
@@ -598,6 +645,7 @@ local function stepsOfKind(list)
   if c and c.n == #list then return c end
   c = { n = #list, accept = {}, turnin = {} }
   for j, s in ipairs(list) do
+    if j % 8 == 0 then ns.MaybeYield() end
     if s.k == "accept" then c.accept[#c.accept + 1] = j elseif s.k == "turnin" then c.turnin[#c.turnin + 1] = j end
   end
   kindsMemo[list] = c
@@ -645,6 +693,7 @@ function Next.LocalBlock(list, planned, pm)
   local E = ns.Engine
   local j0, n, away = nil, 0, 0
   for j = planned + 1, math.min(#list, planned + Next.REJOIN_SCAN) do
+    if j % 8 == 0 then ns.MaybeYield() end
     local s = list[j]
     if Next.KIND[s.k] and s.m then
       local st = E.Status(j)
@@ -689,6 +738,7 @@ function Next.HereBlock(list, planned, px, py, pinst)
   local E = ns.Engine
   local j0, n = nil, 0
   for j = planned + 1, math.min(#list, planned + Next.REJOIN_SCAN) do
+    if j % 8 == 0 then ns.MaybeYield() end
     local s = list[j]
     if Next.TRIP[s.k] then break end
     if Next.KIND[s.k] and s.m and E.Status(j) == "todo" and near(s, Next.HERE_YD) then
@@ -716,7 +766,8 @@ function Next.ChainsInto(q, map, zone)
   if not list then return false end
   if zoneIdx.list ~= list or zoneIdx.n ~= #list then
     local byQ = {}
-    for _, t in ipairs(list) do
+    for i, t in ipairs(list) do
+      if i % 8 == 0 then ns.MaybeYield() end
       if t.q and t.q > 0 and (t.m or t.zone) then
         local e = byQ[t.q]; if not e then e = {}; byQ[t.q] = e end
         if t.m then e[t.m] = true end
@@ -745,6 +796,7 @@ function Next.PickupFirst(list, planned, pick, px, py, pinst, fits)
   if p and pd and pd <= Next.HERE_YD ^ 2 then return nil end -- (the card's stop is right here: no heading out yet)
   local best, bd
   for j = planned, math.min(#list, planned + Next.REJOIN_SCAN) do
+    if j % 8 == 0 then ns.MaybeYield() end
     local s = list[j]
     if Next.TRIP[s.k] then break end
     -- (this visit only: the plan leaving town - a step with a known spot beyond Next.HERE_FAR - ends it. A later visit
@@ -760,6 +812,7 @@ function Next.PickupFirst(list, planned, pick, px, py, pinst, fits)
 end
 
 local function pick(planned)
+  ns.Jobs.Mark("setup")
   local E, St = ns.Engine, ns.State
   local list = ForeverRouteData and ForeverRouteData.steps
   if not (Next.Enabled() and planned and list and list[planned] and ns.Horizon) then Next.res = nil; return nil end
@@ -783,7 +836,7 @@ local function pick(planned)
   local bags = ns.Errands and ns.Errands.FreeSlots and ns.Errands.FreeSlots() or -1
   -- (your level too: a level-up wakes the pick-ups that waited for it, and the pick kept from before it sent you out past
   -- a giver 80 yd away whose quest had just opened - mutate --play, Webwood Venom at 3)
-  local sig = table.concat({ planned, #list, load, math.floor(px / 15), math.floor(py / 15), pinst or 0, tostring(d), math.min(bags, 7), (UnitLevel and UnitLevel("player")) or 0 }, ":")
+  local sig = table.concat({ planned, #list, load, math.floor(px / 15), math.floor(py / 15), pinst or 0, tostring(d), math.min(bags, 7), Next.InputSignature() }, ":")
   local now = GetTime and GetTime() or 0
   -- the pick on the card, by the step itself: a stop inserted before it (a hand-in you finished) moves its number on, and
   -- by number the margin below compared the wrong steps and the card showed whatever sat at the old number - "Accept
@@ -816,6 +869,7 @@ local function pick(planned)
     if moreHere == nil then
       moreHere = false
       for j = planned, math.min(#list, planned + Next.SCAN) do
+        if j % 8 == 0 then ns.MaybeYield() end
         local t = list[j]
         if t.m and inMyZone(t) and E.Status(j) == "todo" then moreHere = true; break end
       end
@@ -864,6 +918,7 @@ local function pick(planned)
   local reserve = pfAny and 1 or 0
   local hereYd2 = Next.HERE_YD ^ 2
   local wload = load
+  ns.Jobs.Mark("planned candidates")
   for j = from, math.min(#list, from + Next.SCAN) do
     if j % 8 == 0 then ns.MaybeYield() end
     local s = list[j]
@@ -917,6 +972,7 @@ local function pick(planned)
   -- (in your zone only, while your path has more here - leavesZone, above: Mirages in the Badlands was "nearby" from
   -- Riverglades)
   if E.BehindYou and E.QuestXP then
+    ns.Jobs.Mark("behind candidates")
     local L = (UnitLevel and UnitLevel("player")) or 1
     -- (the nearest Next.BEHIND_MAX of them within Next.BEHIND_YD: the solve weighs the way there against what they pay)
     -- (how far below you is the price's to say - what the quest still pays you after its work; a window of its own, 4
@@ -960,6 +1016,7 @@ local function pick(planned)
   -- the steps below your place in the plan for quests in your log (Engine.BelowFloor: one you took up again from the
   -- part you passed): extras, close by and worth it - they no longer pull your place back (code review)
   if E.BelowFloor then
+    ns.Jobs.Mark("below floor")
     for _, j in ipairs(E.BelowFloor(planned, 12)) do
       local s = list[j]
       if not byStep[j] then
@@ -977,6 +1034,7 @@ local function pick(planned)
   -- not at all. That used to be a rule of its own: 30% of the quest's XP.) Next.NEAR_READY only bounds the candidates:
   -- the price decides.
   local turnins = stepsOfKind(list).turnin
+  ns.Jobs.Mark("ready handins")
   for x = after(turnins, scanEnd), #turnins do
     ns.MaybeYield()
     local j = turnins[x]
@@ -991,6 +1049,7 @@ local function pick(planned)
   end
   -- a later visit the plan makes to where you are now, all of which you can do now: done now, the trip back for it
   -- goes (a trip to steps that are all done is passed - Engine statusRaw). Worth that trip (Next.VisitHere)
+  ns.Jobs.Mark("later visit")
   local visit = Next.VisitHere(list, planned, planned + 1, here[1], px, py, pinst)
   if visit then
     local share = visit.saves / #visit.now
@@ -1074,6 +1133,7 @@ local function pick(planned)
     cap = (C_QuestLog and C_QuestLog.GetMaxNumQuestsCanAccept and C_QuestLog.GetMaxNumQuestsCanAccept()) or 25 }
   P.cap = cap
   Next.lastP, Next.lastBy, Next.whyNotMemo = P, byStep, {} -- (for Next.WhyNot: "why not that step?")
+  ns.Jobs.Mark("horizon")
   local res = ns.Horizon.Solve(P)
   -- (a vendor isn't a step of the plan: the card shows the plan's next step and its errand line says the vendor - now,
   -- or after the stops before it)
@@ -1209,6 +1269,7 @@ function Next.PickAsync(planned, done)
   -- goes on the card, and planning it then was most of that frame, 8-10 ms at level 50)
   local j = ns.Jobs.Post("solve", function(p)
     local r = pick(p)
+    ns.Jobs.Mark("prewarm trip")
     local L = ForeverRouteData and ForeverRouteData.steps
     local st = L and L[r or p]
     if st and ns.Engine and ns.Engine.TravelFor then ns.Call(ns.Engine.TravelFor, st) end

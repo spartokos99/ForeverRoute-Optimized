@@ -1599,7 +1599,7 @@ end
 function Card.Update(animate)
   if not f then return end
   local t0 = debugprofilestop and debugprofilestop()
-  Card.UpdateInner(animate)
+  ns.Engine.ReadPass(function() Card.UpdateInner(animate) end)
   if t0 and ns.Time then ns.Time("card", debugprofilestop() - t0) end
 end
 -- (timed: what a card redraw costs in your game shows in /fr report)
@@ -1627,6 +1627,7 @@ end
 ns.On("FR_LOADED", function() build(); f:SetShown(not ns.db.hidden); Card.Update() end)
 ns.On("FR_STEP_DONE", function() if f then Card.Update(true) end end)
 ns.On("FR_STEP", function() Card.Update(false) end)
+ns.On("FR_CARD", function() Card.Update(false) end)
 ns.On("FR_ZONETRIPS", function() if f and Card.zoneDoneSince then Card.Update(false) end end) -- (the next bases' trips are in)
 ns.On("FR_PROGRESS", function() Card.Counts() end) -- (a count moved: "Gnoll Paws: 3/8")
 ns.On("FR_DUNGEON", function() if f then Card.Update(false) end end) -- walked into or out of a dungeon
@@ -1658,4 +1659,4 @@ function Card.CheckReadyNearby()
   -- (the distance shown moves with you: redraw when it changed by 10 yd, or another quest or none)
   if (was and was.i) ~= (r and r.i) or (was and r and math.abs(was.d - r.d) >= 10) then Card.Layout() end
 end
-if C_Timer and C_Timer.NewTicker then ns.NewTicker(2, function() pcall(Card.CheckReadyNearby) end) end
+if C_Timer and C_Timer.NewTicker then ns.NewTicker(2, ns.Guard("ready nearby", Card.CheckReadyNearby)) end

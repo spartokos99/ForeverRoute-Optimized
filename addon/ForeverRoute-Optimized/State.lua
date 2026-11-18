@@ -6,12 +6,17 @@ ns.State = State
 
 State.completed = {}   -- [questID] = true
 State.knownTaxi = {}   -- [nodeName] = true
-local cache = {}       -- [questID] = { on, complete, objectives } until the next log change
+local cache = {}       -- [questID] = { on, complete, objectives }, updated by settled log changes
 -- [questID] = true: not handed in, as asked since the last full look (a refresh asks for every quest on the route, ~950
 -- times on a long plan, each a call into the game and a look at every quest that needs it)
 local notDone = {}
 
-local function call(fn, ...) if type(fn) == "function" then local ok, a, b, c, d = pcall(fn, ...); if ok then return a, b, c, d end end end
+local function call(fn, ...)
+  if type(fn) ~= "function" then return end
+  local ok, a, b, c, d, e, f, g, h = pcall(fn, ...)
+  if ok then return a, b, c, d, e, f, g, h end
+  ns.LogError("state API", a)
+end
 
 function State.IsCompleted(id)
   if not id then return false end
@@ -28,12 +33,12 @@ function State.IsCompleted(id)
   return done and true or false
 end
 -- the quests that need quest id (the reverse of ns.QUEST_PRE), built once
-local needers
+local needers, needersFor
 function State.SupersededBy(id)
   local P = ns.QUEST_PRE
   if not P then return nil end
-  if not needers then
-    needers = {}
+  if not needers or needersFor ~= P then
+    needers, needersFor = {}, P
     for q, pre in pairs(P) do
       for _, p in ipairs(pre.g or {}) do needers[p] = needers[p] or {}; table.insert(needers[p], q) end
       for _, p in ipairs(pre.s or {}) do needers[p] = needers[p] or {}; table.insert(needers[p], q) end
@@ -51,41 +56,66 @@ end
 -- asks about every quest on the route - ~600 on a built-in plan - and asking the game each by ID was most of a full
 -- look in the game (50-110 ms at level 36, a tester's saved timings; the simulator's quest API costs nothing)
 local logSet = nil
+State.logRevision = 0
+State.logLevels = {}
 local function readLog()
   local fn = (C_QuestLog and C_QuestLog.GetNumQuestLogEntries) or GetNumQuestLogEntries
   local entries, quests = call(fn)
-  if type(entries) ~= "number" or type(quests) ~= "number" then return false end
-  local set, n = {}, 0
+  if type(entries) ~= "number" then return false end
+  local set, n, collapsed = {}, 0, false
   for i = 1, entries do
-    local id, hdr
-    if C_QuestLog and C_QuestLog.GetInfo then local info = call(C_QuestLog.GetInfo, i); if info then id, hdr = info.questID, info.isHeader end
-    elseif GetQuestLogTitle then local _, _, _, h, _, _, _, q = call(GetQuestLogTitle, i); id, hdr = q, h end
-    if not hdr and type(id) == "number" and id > 0 then set[id] = true; n = n + 1 end
+    local id, hdr, lv
+    if C_QuestLog and C_QuestLog.GetInfo then
+      local info = call(C_QuestLog.GetInfo, i)
+      if type(info) ~= "table" then return false end
+      id, hdr, lv = info.questID, info.isHeader, info.level
+      collapsed = collapsed or (hdr and info.isCollapsed)
+    elseif GetQuestLogTitle then
+      local _, l, _, h, c, _, _, q = call(GetQuestLogTitle, i)
+      id, hdr, lv = q, h, l
+      collapsed = collapsed or (h and c)
+    else return false end
+    if not hdr then
+      if type(id) ~= "number" or id <= 0 then return false end
+      set[id] = true; n = n + 1
+    end
+    if id then State.logLevels[id] = lv end
   end
-  if n ~= quests then return false end
+  if type(quests) == "number" then
+    if n ~= quests then return false end
+  elseif collapsed then return false end
   return set
 end
 State._readLog = readLog -- (tests)
+local function onQuest(id)
+  local on = C_QuestLog and call(C_QuestLog.IsOnQuest, id)
+  if on == nil and C_QuestLog and C_QuestLog.GetLogIndexForQuestID then
+    local index = call(C_QuestLog.GetLogIndexForQuestID, id)
+    on = type(index) == "number" and index > 0
+  end
+  return on and true or false
+end
+local function questInfo(id, on)
+  local c = { on = on, objectives = {} }
+  if not on then return c end
+  local objs = C_QuestLog and call(C_QuestLog.GetQuestObjectives, id)
+  if type(objs) == "table" then
+    for i, o in ipairs(objs) do c.objectives[i] = { text = o.text or "", finished = o.finished, have = o.numFulfilled or 0, need = o.numRequired or 0 } end
+  end
+  local complete = C_QuestLog and call(C_QuestLog.IsComplete, id)
+  if complete == nil then complete = #c.objectives > 0; for _, o in ipairs(c.objectives) do if not o.finished then complete = false end end end
+  c.complete, c.noObjectives = complete and true or false, #c.objectives == 0
+  return c
+end
 -- per-quest live info, by quest ID
 function State.Quest(id)
   if not id then return nil end
   local c = cache[id]
   if c then return c end
   if logSet == nil then logSet = readLog() end
-  if logSet and not logSet[id] then c = { on = false, objectives = {} }; cache[id] = c; return c end
-  local on = C_QuestLog and C_QuestLog.IsOnQuest and call(C_QuestLog.IsOnQuest, id)
-  if on == nil and C_QuestLog and C_QuestLog.GetLogIndexForQuestID then on = call(C_QuestLog.GetLogIndexForQuestID, id) ~= nil end
-  c = { on = on and true or false, objectives = {} }
-  if c.on then
-    local objs = C_QuestLog and call(C_QuestLog.GetQuestObjectives, id)
-    if type(objs) == "table" then
-      for i, o in ipairs(objs) do c.objectives[i] = { text = o.text or "", finished = o.finished, have = o.numFulfilled or 0, need = o.numRequired or 0 } end
-    end
-    local complete = C_QuestLog and C_QuestLog.IsComplete and call(C_QuestLog.IsComplete, id)
-    if complete == nil then complete = #c.objectives > 0; for _, o in ipairs(c.objectives) do if not o.finished then complete = false end end end
-    c.complete = complete and true or false
-    c.noObjectives = #c.objectives == 0
-  end
+  local on
+  if logSet then on = logSet[id] and true or false else on = onQuest(id) end
+  c = questInfo(id, on)
   cache[id] = c
   return c
 end
@@ -112,7 +142,12 @@ function State.LogCount()
   entries = entries or 0
   for i = 1, entries do
     local info = C_QuestLog and C_QuestLog.GetInfo and call(C_QuestLog.GetInfo, i)
-    if info and not info.isHeader then n = n + 1 end
+    if info then
+      if not info.isHeader then n = n + 1 end
+    elseif GetQuestLogTitle then
+      local name, _, _, header = call(GetQuestLogTitle, i)
+      if name and not header then n = n + 1 end
+    end
   end
   return n
 end
@@ -140,8 +175,14 @@ function State.RefreshCompleted()
   end
 end
 
--- visible quest log rows (for the snapshot); route quests are added by ID
+-- visible quest log rows (for the snapshot); route quests are added by ID. Second result: complete enumeration.
 local function logIDs()
+  if logSet == nil then logSet = readLog() end
+  if logSet then
+    local ids = {}
+    for id in pairs(logSet) do ids[id] = true end
+    return ids, true
+  end
   local ids = {}
   local n = C_QuestLog and C_QuestLog.GetNumQuestLogEntries and call(C_QuestLog.GetNumQuestLogEntries) or (GetNumQuestLogEntries and call(GetNumQuestLogEntries)) or 0
   for i = 1, n do
@@ -151,7 +192,8 @@ local function logIDs()
     if id and id > 0 and not hdr then ids[id] = true end
   end
   for _, s in ipairs(ForeverRouteData and ForeverRouteData.steps or {}) do if s.q and State.OnQuest(s.q) then ids[s.q] = true end end
-  return ids
+  for id, c in pairs(cache) do if c.on then ids[id] = true end end
+  return ids, false
 end
 State.LogIDs = logIDs
 -- every quest seen in your log, kept (ns.char.hadQuest): one that is gone from it and not completed was abandoned.
@@ -309,10 +351,10 @@ end
 
 -- FR_STATE (the full look) and FR_PROGRESS (a count moved): while a route change's passes run over frames, the
 -- strongest of them is kept and fired once they end (Engine.Announce) - their listeners act on steps by number
-function State.Announce(ev, coalesce)
+function State.Announce(ev, coalesce, quests)
   local E = ns.Engine
   if E and E.Announce and E.Announce(ev) then return end
-  if ev == "FR_STATE" and coalesce ~= false and E and E.Coalesce then E.Coalesce(function() ns.Fire(ev) end) else ns.Fire(ev) end
+  if ev == "FR_STATE" and coalesce ~= false and E and E.Coalesce then E.Coalesce(function() ns.Fire(ev) end, quests) else ns.Fire(ev) end
 end
 -- where a flight point is in the world (its flight master's spot, FlightMasters.lua): name -> { x, y, instance }
 local function taxiWorld()
@@ -460,92 +502,109 @@ function State.ScanTaxi()
   return added
 end
 
--- After a log change the addon looks again. A kill or a looted quest item only moves a count ("Gnoll Paws: 3/8"): the
--- route is the same, so only the card's counts are redrawn (FR_PROGRESS) - every kill used to rebuild the whole route
--- and re-plan the next stop, a hitch on each one ("frame drops after killing mobs for quests or looting quest items",
--- a player on 1.5.0). A quest taken, finished, handed in or dropped, an objective done, a level: the full look
--- (FR_STATE). The log the game fires QUEST_LOG_UPDATE for many times a minute; most of them change nothing at all.
-State.FULL_EVERY = 120 -- seconds: log changes this long after the last full look get one anyway (anything not read here)
-local pending, fullDue, lastFull = false, true, -1000
-local function now() return GetTime and GetTime() or 0 end
--- the quests in your log as last read (the cache) against the game now: "same", "counts" (only counts moved: the cache
--- now has them) or "changed", "undone" (something done is not any more).
--- It runs on every kill, loot and log update, and a full log made it dear: three calls into the game for each quest in
--- it (in your log? its objectives, finished?), 65 on a log of 21 at level 50. The log's count is read first (one call):
--- while it is the same, the same quests are in it (a quest taken or dropped is QUEST_ACCEPTED / QUEST_REMOVED, the full
--- look; one taken and one dropped between two looks would need both), so "in your log?" is not asked; and "finished?"
--- only of a quest whose objectives don't tell it (none, or all done but not finished - one to go somewhere too). One
--- call a quest. The count moved: each quest asked all three, as before (a quest dropped: "undone"), then the full look.
--- (anything else: the full look every FULL_EVERY)
-local function allFinished(objs) for _, o in ipairs(objs) do if not o.finished then return false end end; return true end
+-- Coalesce quest events, compare the live log, and keep unchanged cache entries. Counts only redraw bars;
+-- membership/readiness changes refresh the route. An unchanged or empty log does no downstream work.
+local pending, fullDue = false, true
+local changedIDs = {}
 function State.CheckLog()
-  local full = State.LogCount() ~= State.logCountWas
-  local any = false
-  local fresh = {}
-  for id, c in pairs(cache) do
-    if c.on then
-      any = true
-      if full then
-        local on = C_QuestLog and C_QuestLog.IsOnQuest and call(C_QuestLog.IsOnQuest, id)
-        if on == nil and C_QuestLog and C_QuestLog.GetLogIndexForQuestID then on = call(C_QuestLog.GetLogIndexForQuestID, id) ~= nil end
-        if not on then return "undone" end
-      end
-      local objs = C_QuestLog and call(C_QuestLog.GetQuestObjectives, id)
-      if type(objs) ~= "table" or #objs ~= #c.objectives then return "changed" end
-      if full or #c.objectives == 0 or c.complete ~= allFinished(c.objectives) then
-        local complete = C_QuestLog and C_QuestLog.IsComplete and call(C_QuestLog.IsComplete, id)
-        if complete ~= nil and (complete and true or false) ~= c.complete then return c.complete and "undone" or "changed" end
-      end
-      for i, o in ipairs(objs) do
-        local was = c.objectives[i]
-        if (o.finished and true or false) ~= (was.finished and true or false) then return was.finished and "undone" or "changed" end
-        if (o.text or "") ~= was.text or (o.numFulfilled or 0) ~= was.have or (o.numRequired or 0) ~= was.need then fresh[#fresh + 1] = { was, o } end
-      end
+  local count = State.LogCount()
+  local current = logSet
+  if current == nil or count ~= State.logCountWas then current = readLog() end
+  local changed, undone, counts = false, false, false
+  local affected, membershipChanged = {}, false
+  local function update(id, on)
+    local c = cache[id]
+    if not c or c.on ~= on then
+      cache[id] = questInfo(id, on)
+      changed, undone = true, undone or (c and c.on and not on)
+      membershipChanged = true
+      return
     end
+    if not on then return end
+    local objs = C_QuestLog and call(C_QuestLog.GetQuestObjectives, id)
+    local complete = C_QuestLog and call(C_QuestLog.IsComplete, id)
+    if type(objs) ~= "table" then return end -- Keep the last readable objectives.
+    if complete == nil then
+      complete = #objs > 0
+      for _, o in ipairs(objs) do if not o.finished then complete = false end end
+    end
+    complete = complete and true or false
+    if complete ~= c.complete then changed, undone, affected[id] = true, undone or c.complete, true end
+    if #objs ~= #c.objectives then changed, undone, affected[id] = true, true, true end
+    for i, o in ipairs(objs) do
+      local was = c.objectives[i]
+      if not was then was = {}; c.objectives[i] = was end
+      if (o.finished and true or false) ~= (was.finished and true or false) then changed, undone, affected[id] = true, undone or was.finished, true end
+      local text, have, need = o.text or "", o.numFulfilled or 0, o.numRequired or 0
+      if text ~= was.text then
+        counts = true
+        local oldText = was.text or ""
+        if have == was.have and need == was.need then
+          affected[id] = true
+        else
+          local oldPair = tostring(was.have or 0) .. "%s*/%s*" .. tostring(was.need or 0)
+          local newPair = tostring(have) .. "%s*/%s*" .. tostring(need)
+          if oldText:gsub(oldPair, "#") ~= text:gsub(newPair, "#") then affected[id] = true end
+        end
+      elseif have ~= was.have or need ~= was.need then counts = true end
+      was.text, was.have, was.need, was.finished = text, have, need, o.finished
+    end
+    for i = #c.objectives, #objs + 1, -1 do c.objectives[i] = nil end
+    c.complete, c.noObjectives = complete, #objs == 0
   end
-  if not any then return "changed" end -- (nothing read yet: nothing to compare with)
-  if full then return "changed" end
-  if #fresh == 0 then return "same" end
-  for _, p in ipairs(fresh) do p[1].text, p[1].have, p[1].need = p[2].text or "", p[2].numFulfilled or 0, p[2].numRequired or 0 end
-  return "counts"
+  if current then
+    for id, c in pairs(cache) do if c.on and not current[id] then update(id, false) end end
+    for id in pairs(current) do update(id, true) end
+  else
+    -- Collapsed headers hide IDs. Known absences only need checking on membership events/count changes.
+    local membership = fullDue or State.LogCount() ~= State.logCountWas
+    for id, c in pairs(cache) do if membership or c.on then update(id, onQuest(id)) end end
+    for id in pairs(changedIDs) do if not cache[id] then update(id, onQuest(id)) end end
+  end
+  logSet = current
+  State.logCountWas = count
+  wipe(changedIDs)
+  if changed then State.logRevision = State.logRevision + 1 end
+  return undone and "undone" or changed and "changed" or counts and "counts" or "same", not membershipChanged and affected or nil
 end
 local function settle()
   pending = false
-  if not fullDue and now() - lastFull < State.FULL_EVERY then
-    local ok, how = pcall(State.CheckLog)
-    if ok and how == "same" then return end
-    -- (something done is not any more - an item destroyed, a quest dropped: the plan is looked at from its start again)
-    if ok and how == "undone" and ns.Engine and ns.Engine.ForgetDone then ns.Engine.ForgetDone() end
-    if ok and how == "counts" then
-      local t0 = debugprofilestop and debugprofilestop()
-      State.Announce("FR_PROGRESS")
-      if t0 and ns.Time then ns.Time("counts", debugprofilestop() - t0) end
-      return
-    end
+  local how, affected = State.CheckLog()
+  if how == "undone" and ns.Engine and ns.Engine.ForgetDone then ns.Engine.ForgetDone() end
+  if not fullDue and how == "same" then return end
+  if not fullDue and how == "counts" then
+    -- Objective matching also reads text; a newly supplied description can change which step is done.
+    if next(affected) and ns.Engine and ns.Engine.InvalidateProgress then ns.Engine.InvalidateProgress("counts", affected) end
+    local t0 = debugprofilestop and debugprofilestop()
+    State.Announce("FR_PROGRESS")
+    if t0 and ns.Time then ns.Time("counts", debugprofilestop() - t0) end
+    return
   end
-  fullDue, lastFull = false, now()
-  wipe(cache); logSet = nil
+  local quests = not fullDue and how == "changed" and affected or nil
+  fullDue = false
   if ns.Engine and ns.Engine.GrayForget then ns.Engine.GrayForget() end -- (the gray rule's chains: Engine.LeadsTo)
-  State.logCountWas = State.LogCount()
   local t0 = debugprofilestop and debugprofilestop()
-  State.Announce("FR_STATE")
+  State.Announce("FR_STATE", nil, quests)
   if t0 and ns.Time then ns.Time("logchange", debugprofilestop() - t0) end
 end
 local function schedule()
   if pending then return end
   pending = true
-  C_Timer.After(0.15, settle)
+  C_Timer.After(0.15, ns.Guard("quest update", settle))
 end
 -- something more than a count may have changed: the full look
 local function refreshSoon()
-  wipe(cache); logSet = nil
   if ns.Engine and ns.Engine.GrayForget then ns.Engine.GrayForget() end
   fullDue = true
   schedule()
 end
 -- the log changed: maybe only a count
 local function logSoon() schedule() end
-State.Invalidate = refreshSoon
+function State.Invalidate()
+  wipe(cache); logSet = nil
+  State.logRevision = State.logRevision + 1
+  refreshSoon()
+end
 State._notDone, State._settle = notDone, settle -- (tests)
 
 ns.On("FR_LOADED", function() State.knownTaxi = ns.char.knownTaxi or {}; C_Timer.After(3, ns.Guard("taxi", State.ScanTaxi)) end)
@@ -553,12 +612,23 @@ ns.On("TAXI_NODE_STATUS_CHANGED", function() C_Timer.After(0.5, ns.Guard("taxi",
 ns.On("PLAYER_LOGIN", function() State.RefreshCompleted(); wipe(notDone); refreshSoon(); C_Timer.After(8, function() State.Snapshot("login") end); ns.NewTicker(300, function() State.Snapshot("periodic") end) end)
 ns.On("QUEST_LOG_UPDATE", logSoon)
 ns.On("UNIT_QUEST_LOG_CHANGED", function(unit) if unit == "player" then logSoon() end end)
-ns.On("QUEST_ACCEPTED", refreshSoon)
-ns.On("QUEST_REMOVED", refreshSoon)
+local function questChanged(id)
+  if type(id) == "number" then cache[id] = nil; changedIDs[id] = true end
+  logSet = nil
+  State.logRevision = State.logRevision + 1
+  refreshSoon()
+end
+ns.On("QUEST_ACCEPTED", function(a, b) questChanged(type(b) == "number" and b or a) end)
+ns.On("QUEST_REMOVED", questChanged)
+ns.On("QUEST_WATCH_UPDATE", schedule)
+ns.On("PLAYER_ENTERING_WORLD", function() State.RefreshCompleted(); wipe(notDone); State.Invalidate() end)
+ns.On("QUEST_DATA_LOAD_RESULT", function(id, success)
+  if success and id and notDone[id] then notDone[id] = nil; refreshSoon() end
+end)
 ns.On("QUEST_TURNED_IN", function(id)
   if id then State.completed[id] = true end
   wipe(notDone) -- (a hand-in is what makes a quest done - and the ones it supersedes: asked again)
-  refreshSoon()
+  questChanged(id)
   C_Timer.After(0.5, function() State.Snapshot("turnin") end)
 end)
 ns.On("PLAYER_LEVEL_UP", function() refreshSoon(); C_Timer.After(1, function() State.Snapshot("levelup") end) end)

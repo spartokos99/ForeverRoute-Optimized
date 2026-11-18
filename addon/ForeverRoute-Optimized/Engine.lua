@@ -699,11 +699,16 @@ function Engine.HereMap()
 end
 -- The part of the built-in plan behind you, by the place of a step alone: -> before(j), low(j) for this moment, and
 -- the step you joined at
+local passedMemo
 local function passedPart(c, list)
   local L = UnitLevel("player") or 1
   local _, at = Engine.Place()
   local f1, f2 = nil, nil
   if at then f1, f2 = Engine.FirstStretch() end
+  local memo = passedMemo
+  if memo and memo.index == c and memo.level == L and memo.at == at and memo.first == f1 and memo.last == f2 then
+    return memo.before, memo.low, at
+  end
   -- before the trip you joined at, and not in the stretch you start in - nor a quest in the zone you joined in, at your
   -- level: the card sent a tester to Riverglades and the first half of its quests (Gnoll Infestation, 36, at 37, from
   -- the giver he stood at) were behind him, because the plan reached his level at step 1132; offered back one by one as
@@ -732,6 +737,7 @@ local function passedPart(c, list)
     local e = c.eff[j]
     return (e and e < L - Engine.JOIN_GAP and not (start and j < firstTrip(c, list))) or false
   end
+  passedMemo = { index = c, level = L, at = at, first = f1, last = f2, before = before, low = low }
   return before, low, at
 end
 -- Is step j in the part of the plan behind you by its place alone, whatever its quest's state? Engine.BehindYou says
@@ -1205,7 +1211,10 @@ ns.On("PLAYER_ENTERING_WORLD", function() Engine.placeReady = true end)
 -- it (a slice a frame); a step found not done there resets it and refreshes.
 local doneRun = { list = nil, k = 0, step = nil, key = nil }
 Engine.doneRunMiss = 0 -- (the simulator: times the check found the run wrong)
-function Engine.ForgetDone() doneRun.list = nil; doneRun.k = 0 end
+function Engine.ForgetDone()
+  doneRun.list = nil; doneRun.k = 0
+  if Engine.InvalidateProgress then Engine.InvalidateProgress() end
+end
 local function doneKey(skipFrom, skipTo)
   local c = ns.char or {}
   local j = c.join
@@ -1502,10 +1511,78 @@ function Engine.Upcoming(from, n)
   return out
 end
 
+Engine.progressRevision = 0
+local progress
+-- A full refresh can change chain/place rules. Bag, XP and cooldown events only affect non-quest
+-- steps (including travel passed because of those steps), so their totals can be adjusted by delta.
+function Engine.InvalidateProgress(kind, quests)
+  Engine.progressRevision = Engine.progressRevision + 1
+  if not kind and not quests then progress = nil; return end
+  if progress then
+    for _, i in ipairs(progress.dynamic) do progress.dirty[i] = true end
+    if quests then
+      -- BehindYou follows the plan's prerequisite graph. Readiness can move a carried quest's
+      -- next step across the join boundary, so include its follow-ups as well as travel steps.
+      local seen, queue = {}, {}
+      for q in pairs(quests) do seen[q] = true; queue[#queue + 1] = q end
+      local head = 1
+      while head <= #queue do
+        local q = queue[head]; head = head + 1
+        for _, i in ipairs(progress.byQuest[q] or {}) do progress.dirty[i] = true end
+        for _, d in ipairs((ForeverRouteUnlocks and ForeverRouteUnlocks[q]) or {}) do
+          if not seen[d] then seen[d] = true; queue[#queue + 1] = d end
+        end
+      end
+    end
+  end
+end
+local function progressState()
+  local list, data = steps(), ForeverRouteData
+  local p, ch = progress, ns.char or {}
+  local join, taken = ch.join, ns.Next and ns.Next.taken
+  local level = UnitLevel("player")
+  if not p or p.list ~= list or p.n ~= #list or p.data ~= data or p.level ~= level or p.here ~= Engine.here
+    or p.taken ~= taken or p.finish ~= Engine.finishNow or p.noPlace ~= Engine.noPlace
+    or p.join ~= join or p.joinLevel ~= (join and join.level) or p.joinFirst ~= (join and join.first)
+    or p.manual ~= ch.manualDone or p.skipped ~= ch.skipped or p.nope ~= ch.nope then
+    p = { list = list, n = #list, data = data, level = level, here = Engine.here, taken = taken,
+      finish = Engine.finishNow, noPlace = Engine.noPlace, join = join, joinLevel = join and join.level,
+      joinFirst = join and join.first, manual = ch.manualDone, skipped = ch.skipped, nope = ch.nope,
+      done = 0, values = {}, dirty = {}, dynamic = {}, byQuest = {}, legs = {}, legAt = {} }
+    local leg
+    for i, s in ipairs(list) do
+      if not leg or s.k == "fly" then leg = { first = i, last = i, done = 0 }; p.legs[#p.legs + 1] = leg end
+      leg.last, p.legAt[i], p.dirty[i] = i, leg, true
+      if s.k ~= "accept" and s.k ~= "obj" and s.k ~= "turnin" then p.dynamic[#p.dynamic + 1] = i end
+      if s.q then
+        local by = p.byQuest[s.q]
+        if not by then by = {}; p.byQuest[s.q] = by end
+        by[#by + 1] = i
+      end
+    end
+    progress = p
+  end
+  return p
+end
+local function updateProgress(p, first, last)
+  Engine.ReadPass(function()
+    local function update(i)
+      local value = Engine.IsDone(i) and 1 or 0
+      local delta = value - (p.values[i] or 0)
+      p.values[i], p.dirty[i] = value, nil
+      p.done = p.done + delta
+      p.legAt[i].done = p.legAt[i].done + delta
+    end
+    if first then for i = first, last do if p.dirty[i] then update(i) end end
+    else for i in pairs(p.dirty) do update(i) end end
+  end)
+end
 function Engine.Progress()
-  local list = steps(); local done = 0
-  for i = 1, #list do if Engine.IsDone(i) then done = done + 1 end end
-  return done, #list
+  local t0 = debugprofilestop and debugprofilestop()
+  local p = progressState()
+  updateProgress(p)
+  if t0 then ns.Time("progress", debugprofilestop() - t0) end
+  return p.done, p.n
 end
 
 -- the step on the card, or the one you look at (Engine.view). While a route change's passes run over frames, the
@@ -1523,12 +1600,12 @@ end
 function Engine.LegProgress(i)
   local list = steps(); i = i or Engine.PlanAt()
   if not i or not list[i] then return 0, 0, nil end
-  local a, b = i, i
-  while a > 1 and list[a].k ~= "fly" do a = a - 1 end
-  if list[a].k == "fly" and a < i then a = a + 1 end
-  while b < #list and list[b + 1].k ~= "fly" do b = b + 1 end
-  local done = 0
-  for j = a, b do if Engine.IsDone(j) then done = done + 1 end end
+  local p = progressState()
+  local leg = p.legAt[i]
+  local a, b = leg.first, leg.last
+  updateProgress(p, a, b)
+  local done = leg.done
+  if list[a].k == "fly" and a < i then done = done - p.values[a]; a = a + 1 end
   local zone = list[i].zone or (list[a] and list[a].zone)
   return done, b - a + 1, zone
 end
@@ -1740,13 +1817,20 @@ end)
 -- refreshes its parts ask for - the plan's own, a hand-in added, a side trip's stop, a focus - are one, run when
 -- they are all done. An objective finished ran three back to back (15 ms each at level 50: the perf battery)
 local held -- nil, or true while a change is taken in; "due" once a refresh was asked for
-function Engine.Coalesce(fn)
+local heldRefreshes = 0
+function Engine.Coalesce(fn, quests)
   if held then return fn() end
   held = true
+  heldRefreshes = 0
   local ok, err = pcall(fn)
   local due = held == "due"
   held = nil
-  if due then Engine.bgSolve = true; local ok2, e2 = pcall(Engine.Refresh); Engine.bgSolve = nil; if not ok2 then error(e2, 0) end end
+  if due then
+    Engine.bgSolve = true
+    local ok2, e2 = pcall(Engine.Refresh, heldRefreshes == 1 and quests or nil)
+    Engine.bgSolve = nil
+    if not ok2 then error(e2, 0) end
+  end
   if not ok then error(err, 0) end
 end
 for _, e in ipairs({ "QUEST_REMOVED", "HEARTHSTONE_BOUND", "PLAYER_ENTERING_WORLD", "FR_ROUTE_CHANGED", "FR_NOPE" }) do
@@ -1796,10 +1880,12 @@ function Engine.ShowPick(pick)
   if Engine.view and Engine.view == Engine.current then Engine.view = nil end
   ns.Fire("FR_STEP", Engine.Shown())
 end
-function Engine.Refresh()
-  if held then held = "due"; return end
+function Engine.Refresh(quests)
+  if held then held = "due"; heldRefreshes = heldRefreshes + 1; return end
+  Engine.InvalidateProgress(nil, quests)
   if switching then return end -- (a route switch's own refreshes: Engine.Switch does them)
   if Engine.Busy() then run.due = true; return end -- (while a route change's passes run: when they end)
+  if ns.Next then ns.Next.revision = (ns.Next.revision or 0) + 1 end
   local outer = batch == nil
   if outer then batch = {} else wipe(batch) end -- a nested refresh follows a change: start the reuse over
   if Engine.CHECK_RUN_NOW then Engine.GrayForget() end -- (tests change quests without the game's events)
@@ -2039,6 +2125,11 @@ local function nearCurrent(kind, within)
 end
 
 ns.On("FR_STATE", function() Engine.Refresh() end)
+ns.On("BAG_UPDATE_DELAYED", function() Engine.InvalidateProgress("bonus") end)
+ns.On("SPELL_UPDATE_COOLDOWN", function() Engine.InvalidateProgress("hearth") end)
+ns.On("BAG_UPDATE_COOLDOWN", function() Engine.InvalidateProgress("hearth") end)
+ns.On("PLAYER_XP_UPDATE", function() Engine.InvalidateProgress("grind") end)
+ns.On("FR_ROUTE_CHANGED", function() Engine.InvalidateProgress() end)
 ns.On("PLAYER_ENTERING_WORLD", function()
   quiet = true
   C_Timer.After(1, function() Engine.RefreshBg() end)

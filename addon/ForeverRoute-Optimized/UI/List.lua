@@ -132,13 +132,12 @@ end
 
 -- (the engine says "step" on every refresh, and on a flight that is all the time - the position changes fast: with
 -- the list open, each one rebuilt the whole list, every step's status, and the game stuttered for the whole flight -
--- tester. Now only when what it shows changed, or every few seconds for live counts). Scrolling only redraws the rows
+-- tester. Now only when what it shows changed). Scrolling only redraws the rows
 -- (it rebuilt the whole list too - "scrolling too makes it stutter", tester).
 --   List.Draw()        from the engine: nothing unless something changed
 --   List.Draw("rows")  scrolled: the visible rows only
 --   List.Draw(true)    opened, switched route: all of it
-List.REDRAW_SECS = 5
-local lastSig, lastAt = nil, 0
+local lastSig
 local passData, passFull
 local function drawPass()
   local data, full = passData, passFull
@@ -156,12 +155,11 @@ function List.Draw(mode)
   local data = ForeverRouteData
   local E = ns.Engine
   local sig = table.concat({ tostring(data), tostring(data and data.steps), tostring(data and data.steps and #data.steps), tostring(E.Shown and E.Shown()),
-    tostring(E.CardAt()), tostring(E.planned), tostring(E.view), tostring(E.focus), tostring(ns.db.hideDone) }, ":")
-  local now = GetTime and GetTime() or 0
-  local changed = sig ~= lastSig or now - lastAt >= List.REDRAW_SECS
+    tostring(E.CardAt()), tostring(E.planned), tostring(E.view), tostring(E.focus), tostring(ns.db.hideDone), tostring(E.progressRevision) }, ":")
+  local changed = sig ~= lastSig
   if mode == nil and not changed then return end
   local full = changed or mode == true
-  if full then lastSig, lastAt = sig, now end
+  if full then lastSig = sig end
   passData, passFull = data, full
   -- (each step's status once for the whole draw: Engine.ReadPass)
   E.ReadPass(drawPass)

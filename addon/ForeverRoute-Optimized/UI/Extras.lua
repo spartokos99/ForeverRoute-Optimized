@@ -9,9 +9,16 @@ local HBD = LibStub("HereBeDragons-2.0")
 local NEAR = 250 -- yards
 
 -- does the current route already hand this quest in?
+local turnins, turninsFor, turninsN, turninsRevision
 local function routeTurnsIn(q)
-  for _, s in ipairs(ForeverRouteData and ForeverRouteData.steps or {}) do if s.k == "turnin" and s.q == q then return true end end
-  return false
+  local list = ForeverRouteData and ForeverRouteData.steps
+  if not list then return false end
+  local revision = ns.Engine.progressRevision
+  if turninsFor ~= list or turninsN ~= #list or turninsRevision ~= revision then
+    turnins, turninsFor, turninsN, turninsRevision = {}, list, #list, revision
+    for _, s in ipairs(list) do if s.k == "turnin" and s.q then turnins[s.q] = true end end
+  end
+  return turnins[q] or false
 end
 
 -- finished quests with no hand-in on the route whose NPC is within reach: { { q, name, npc, yards } } nearest first
@@ -49,7 +56,7 @@ end
 local last
 local function check()
   local l = Extras.Line()
-  if l ~= last then last = l; ns.Fire("FR_STEP", ns.Engine.Shown()) end
+  if l ~= last then last = l; ns.Fire("FR_CARD") end
 end
 ns.On("FR_STATE", function() C_Timer.After(0.2, check) end)
 ns.On("FR_LOADED", function() ns.NewTicker(3, ns.Guard("extras", check)) end)

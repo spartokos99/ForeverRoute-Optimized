@@ -189,8 +189,8 @@ function Engine.WatchShortcut()
   ns.Fire("FR_STEP", i)
   return true
 end
-local nextFrom -- { x, y, inst, t }: where the live solver last ran from
--- You moved on (30 yd, or 5 s): only the next stop's solve can change - the plan's statuses don't move with you. It
+local nextFrom -- position and inputs used by the last requested solve
+-- You moved on (30 yd), or a solver input changed: only the next stop's solve can change. It
 -- runs in the background, a slice a frame (Next.PickAsync), and only when it picks another step than the card shows
 -- does the card change (the full refresh, which finds that solve remembered). It used to be the full refresh every
 -- time, in one frame: 20-50 ms at level 50, a hitch every 30 yards (the perf battery, tools/perf-gate.js)
@@ -218,12 +218,17 @@ function Engine.UpdateFocus(px, py, pinst)
   -- where you are - the card keeps its step (the arrow points to your corpse) and solves again once you're alive. Running
   -- past a hand-in as a ghost put it on the card (tester)
   if ns.Is(UnitIsDeadOrGhost, "player") then nextFrom = nil; return end
-  -- the live solver decides the order: it runs again as you move (30 yd, or every 5 s), the focus rules don't
+  -- The one-second driver still detects motion and expired holds; standing still does not start a search.
   if ns.Next and ns.Next.Enabled() then
+    if not Engine.planned then nextFrom = nil; return end
     local now = GetTime()
-    Engine.pos = { px, py, pinst, now } -- (the solve starts from here: the position this check measured)
-    if not nextFrom or nextFrom.inst ~= pinst or (px - nextFrom.x) ^ 2 + (py - nextFrom.y) ^ 2 > 900 or now - nextFrom.t > 5 then
-      nextFrom = { x = px, y = py, inst = pinst, t = now }
+    Engine.pos = Engine.pos or {}
+    Engine.pos[1], Engine.pos[2], Engine.pos[3], Engine.pos[4] = px, py, pinst, now
+    local signature = ns.Next.InputSignature and ns.Next.InputSignature() or ""
+    local holding = Engine.Holding() or Engine.RecentProgress(Engine.planned)
+    if not nextFrom or nextFrom.inst ~= pinst or (px - nextFrom.x) ^ 2 + (py - nextFrom.y) ^ 2 > 900
+      or nextFrom.signature ~= signature or nextFrom.planned ~= Engine.planned or nextFrom.holding ~= holding then
+      nextFrom = { x = px, y = py, inst = pinst, signature = signature, planned = Engine.planned, holding = holding }
       Engine.Repick()
     end
     return

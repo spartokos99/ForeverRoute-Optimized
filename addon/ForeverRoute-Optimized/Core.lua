@@ -135,13 +135,17 @@ end
 -- (a listener runs under pcall, so it may never pause a job: the job's slice is off while listeners run - inside a
 -- route pass, FR_STEP_DONE's listeners run in the pass's coroutine, and a pause in one would be lost with its work)
 function ns.Fire(event, ...)
+  local t0 = clock and clock()
   local co = ns.sliceCo
   ns.sliceCo = nil
-  for _, fn in ipairs(listeners[event] or {}) do
+  for i, fn in ipairs(listeners[event] or {}) do
+    local listenerT0 = event == "FR_STATE" and clock and clock()
     local ok, err = pcall(fn, ...)
+    if listenerT0 then ns.Time("FR_STATE listener " .. i, clock() - listenerT0) end
     if not ok then ns.LogError(event, err) end
   end
   ns.sliceCo = co
+  if t0 then ns.Time("event " .. event, clock() - t0) end
 end
 
 -- item API: Forever moved these into C_Item (the old globals are gone)
@@ -450,7 +454,8 @@ SlashCmdList.FOREVERROUTE = function(msg)
   elseif msg == "nav" or msg == "pins" then for _, l in ipairs(ns.Nav.Report()) do ns.Print(l) end
   elseif msg == "perf" then
     local p = ns.Perf()
-    ns.Print(string.format("memory %s  ·  refresh %.2f ms  ·  progress %.2f ms  ·  %d routes, %d unpacked", p.memoryKB and string.format("%.1f MB", p.memoryKB / 1024) or "?", p.refreshMs or 0, p.progressMs or 0, p.routes, p.unpacked))
+    local function timing(avg, peak) return avg and string.format("%.2f ms avg / %.2f ms max", avg, peak or avg) or "not sampled yet" end
+    ns.Print(string.format("memory %s  ·  refresh %s  ·  progress %s  ·  %d routes, %d unpacked", p.memoryKB and string.format("%.1f MB", p.memoryKB / 1024) or "?", timing(p.refreshMs, p.refreshMaxMs), timing(p.progressMs, p.progressMaxMs), p.routes, p.unpacked))
   elseif msg == "trails" then
     local n, per = ns.Trails.Count(); local bits = {}
     for k, v in pairs(per) do bits[#bits + 1] = k .. " " .. v end
@@ -474,8 +479,7 @@ SlashCmdList.FOREVERROUTE = function(msg)
   end
 end
 
--- /fr perf: what the addon costs in your game (memory, time per refresh), also saved with the snapshot
--- memOnly (at logout): just the memory, keeping the last timing - the timing runs ten route rebuilds, too long there
+-- Passive timings from real work: diagnostics must not run ten route rebuilds or move the player's step.
 function ns.Perf(memOnly)
   if UpdateAddOnMemoryUsage then pcall(UpdateAddOnMemoryUsage) end
   local mem = GetAddOnMemoryUsage and select(2, pcall(GetAddOnMemoryUsage, ADDON)) or nil
@@ -485,22 +489,22 @@ function ns.Perf(memOnly)
     ns.char.perf = p
     return p
   end
-  local t = debugprofilestop
-  local refresh, progress
-  if t then
-    local a = t(); for _ = 1, 10 do ns.Engine.Refresh() end; local b = t(); for _ = 1, 10 do ns.Engine.Progress() end; local c = t()
-    refresh, progress = (b - a) / 10, (c - b) / 10
-  end
+  local refresh, progress = ns.stats.refresh, ns.stats.progress
+  local previous = ns.char.perf or {}
   local unpacked = 0; for _, r in ipairs(ns.Routes()) do if r.steps then unpacked = unpacked + 1 end end
-  local p = { memoryKB = type(mem) == "number" and math.floor(mem) or nil, refreshMs = refresh, progressMs = progress, routes = #ns.Routes(), unpacked = unpacked, at = time and time() }
+  local p = { memoryKB = type(mem) == "number" and math.floor(mem) or nil,
+    refreshMs = refresh and refresh.total / refresh.n or previous.refreshMs,
+    refreshMaxMs = refresh and refresh.max or previous.refreshMaxMs,
+    progressMs = progress and progress.total / progress.n or previous.progressMs,
+    progressMaxMs = progress and progress.max or previous.progressMaxMs,
+    routes = #ns.Routes(), unpacked = unpacked, at = time and time() }
   ns.char.perf = p
   return p
 end
 
 local function perfSample()
-  if UpdateAddOnMemoryUsage then pcall(UpdateAddOnMemoryUsage) end
-  local okm, mem = pcall(GetAddOnMemoryUsage or error, ADDON)
-  local e = { at = time and time() or 0, memoryKB = okm and type(mem) == "number" and math.floor(mem) or nil, level = UnitLevel("player"), route = ns.char and ns.char.routeId } -- no map id: Forever may hand it out as a protected value that can't be saved
+  local perf = ns.Perf() -- Preserve numeric timings before resetting the sample window.
+  local e = { at = time and time() or 0, memoryKB = perf.memoryKB, level = UnitLevel("player"), route = ns.char and ns.char.routeId } -- no map id: Forever may hand it out as a protected value that can't be saved
   for name, st in pairs(ns.stats) do e[name] = string.format("%d calls, avg %.2f ms, max %.2f ms", st.n, st.n > 0 and st.total / st.n or 0, st.max) end
   wipe(ns.stats)
   ns.char.perfLog = ns.char.perfLog or {}
@@ -512,4 +516,3 @@ local guardedSample = ns.Guard("perf", perfSample)
 ns.On("FR_LOADED", function() C_Timer.After(60, guardedSample); ns.NewTicker(300, guardedSample) end)
 ns.On("PLAYER_LOGOUT", guardedSample)
 ns._perfSample = perfSample -- for tests
-

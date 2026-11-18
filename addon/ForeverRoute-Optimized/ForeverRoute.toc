@@ -2,7 +2,7 @@
 ## Title: Forever Route
 ## Notes: Your own leveling route, on rails: step card, waypoint arrow, map pins, live quest tracking.
 ## Author: noopz
-## Version: dev
+## Version: 1.6.8-opt.1
 ## SavedVariables: ForeverRouteDB
 ## SavedVariablesPerCharacter: ForeverRouteChar
 ## OptionalDeps: Questie
